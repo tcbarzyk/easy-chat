@@ -168,7 +168,10 @@ func handleConnection(conn net.Conn) {
 	fmt.Fprintln(conn, "Welcome to the chatroom.")
 	printConnectedUsers(client)
 
-	registerUser(client, reader)
+	err := registerUser(client, reader)
+	if err != nil {
+		return
+	}
 
 	defer func() {
 		leaveChan <- LeaveEvent{client: client}
