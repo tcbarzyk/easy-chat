@@ -6,26 +6,56 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 )
 
-//issue: currently, a user will still be part of the clients map if they have connected but not selected a username. this may lead to behavior such as, when a user types /users and there is another user online who has not selected a username, it will display (for example) "2 users online" but only print 1 username
+type BroadcastType int
+
+const (
+	ToAll BroadcastType = iota
+	ToSender
+	ToAllButSender
+	ToUser
+)
 
 type Client struct {
-	Conn          net.Conn
-	Username      string
-	NumOfMessages int
+	conn          net.Conn
+	username      string
+	numOfMessages int
+}
+
+type Message struct {
+	sender        *Client
+	recipient     *Client
+	content       string
+	broadcastType BroadcastType
+}
+
+type LeaveEvent struct {
+	client *Client
+}
+
+type UserListRequest struct {
+	reply chan []string
+}
+
+type RegisterRequest struct {
+	client   *Client
+	username string
+	reply    chan bool
 }
 
 func NewClient(conn net.Conn) *Client {
 	return &Client{
-		Conn:          conn,
-		NumOfMessages: 0,
+		conn:          conn,
+		numOfMessages: 0,
 	}
 }
 
-var mu sync.Mutex
 var clients = make(map[net.Conn]*Client)
+var msgChan = make(chan Message)
+var leaveChan = make(chan LeaveEvent)
+var userListChan = make(chan UserListRequest)
+var registerChan = make(chan RegisterRequest)
 
 func main() {
 
@@ -37,6 +67,7 @@ func main() {
 	defer listener.Close()
 
 	log.Println("Server listening...")
+	go hub()
 
 	for {
 
@@ -50,37 +81,79 @@ func main() {
 	}
 }
 
-func broadcast(msg string, sender net.Conn) {
-	mu.Lock()
-	defer mu.Unlock()
-	for client := range clients {
-		if client != sender {
-			fmt.Fprintln(client, msg)
-			fmt.Fprint(client, "> ")
+func hub() {
+	for {
+		select {
+		case msg := <-msgChan:
+			broadcast(msg)
+		case event := <-leaveChan:
+			delete(clients, event.client.conn)
+		case req := <-userListChan:
+			userList := getConnectedUsers()
+			req.reply <- userList
+		case req := <-registerChan:
+			exists := usernameExists(req.username)
+			if !exists {
+				req.client.username = req.username
+				clients[req.client.conn] = req.client
+				req.reply <- true
+			} else {
+				req.reply <- false
+			}
 		}
 	}
 }
 
-func printConnectedUsers(conn net.Conn) {
-	mu.Lock()
-	printedAUser := false
-	for _, c := range clients {
-		if c.Username != "" {
-			fmt.Fprintf(conn, "- %s \n", c.Username)
-			printedAUser = true
+func broadcast(msg Message) {
+	switch msg.broadcastType {
+	case ToAll:
+		for conn := range clients {
+			fmt.Fprintln(conn, msg.content)
+			fmt.Fprint(conn, "> ")
+		}
+	case ToSender:
+		fmt.Fprintln(msg.sender.conn, msg.content)
+		fmt.Fprint(msg.sender.conn, "> ")
+	case ToAllButSender:
+		for conn := range clients {
+			if conn != msg.sender.conn {
+				fmt.Fprintln(conn, msg.content)
+				fmt.Fprint(conn, "> ")
+			}
+		}
+	case ToUser:
+		if msg.recipient != nil {
+			fmt.Fprintln(msg.recipient.conn, msg.content)
+			fmt.Fprint(msg.recipient.conn, "> ")
 		}
 	}
-	if !printedAUser {
-		fmt.Fprintln(conn, "(no connected users)")
+}
+
+func getConnectedUsers() []string {
+	usernames := make([]string, 0)
+	for _, c := range clients {
+		if c.username != "" {
+			usernames = append(usernames, c.username)
+		}
 	}
-	mu.Unlock()
+	return usernames
+}
+
+func printConnectedUsers(client *Client) {
+	reply := make(chan []string)
+	userListChan <- UserListRequest{reply: reply}
+	users := <-reply
+	msg := fmt.Sprintf("There are currently %v connected users\n", len(users))
+	fmt.Fprint(client.conn, msg)
+	for _, username := range users {
+		msg := fmt.Sprintf("- %s\n", username)
+		fmt.Fprint(client.conn, msg)
+	}
 }
 
 func usernameExists(username string) bool {
-	mu.Lock()
-	defer mu.Unlock()
 	for _, c := range clients {
-		if username == c.Username {
+		if username == c.username {
 			return true
 		}
 	}
@@ -88,75 +161,91 @@ func usernameExists(username string) bool {
 }
 
 func handleConnection(conn net.Conn) {
-
-	defer func() {
-		conn.Close()
-		mu.Lock()
-		delete(clients, conn)
-		mu.Unlock()
-	}()
-
 	reader := bufio.NewReader(conn)
 
 	client := NewClient(conn)
 
-	mu.Lock()
-	clients[conn] = client
-	mu.Unlock()
+	fmt.Fprintln(conn, "Welcome to the chatroom.")
+	printConnectedUsers(client)
 
-	fmt.Fprintln(conn, "Welcome to the chatroom. Connected users: ")
-	printConnectedUsers(conn)
-	fmt.Fprintln(conn, "Enter username: ")
-	foundUsername := false
-	for !foundUsername {
-		fmt.Fprint(conn, "> ")
-		username, err := receiveMessage(reader)
-		if err != nil {
-			return
-		}
-		username = strings.ToUpper(username)
-		if username == "" {
-			fmt.Fprintln(conn, "Username cannot be empty! Enter a different username: ")
-		} else if usernameExists(username) {
-			fmt.Fprintln(conn, "Username already in use! Enter a different username: ")
-		} else {
-			foundUsername = true
-			mu.Lock()
-			client.Username = username
-			mu.Unlock()
-		}
-	}
+	registerUser(client, reader)
 
-	fmt.Fprintf(conn, "You have joined the chatroom as %s.\n", client.Username)
+	defer func() {
+		leaveChan <- LeaveEvent{client: client}
+		conn.Close()
+	}()
 
-	msg := fmt.Sprintf("%s has joined the chat.", client.Username)
-	broadcast(msg, conn)
+	fmt.Fprintf(conn, "You have joined the chatroom as %s.\n", client.username)
+
+	msg := fmt.Sprintf("%s has joined the chat.", client.username)
+	msgChan <- Message{sender: client, content: msg, broadcastType: ToAllButSender}
 
 	for {
 		fmt.Fprint(conn, "> ")
 		message, err := receiveMessage(reader)
 		if err != nil {
-			msg := fmt.Sprintf("%s has left the chat.", client.Username)
-			broadcast(msg, conn)
+			msg := fmt.Sprintf("%s has left the chat.", client.username)
+			msgChan <- Message{sender: client, content: msg, broadcastType: ToAllButSender}
 			return
 		} else if message == "" {
 			continue
-		} else if strings.ToLower(message) == "/quit" {
-			msg := fmt.Sprintf("%s has left the chat.", client.Username)
-			broadcast(msg, conn)
-			return
-		} else if strings.ToLower(message) == "/users" {
-			mu.Lock()
-			fmt.Fprintf(conn, "There are currently %v connected users\n", len(clients))
-			mu.Unlock()
-			printConnectedUsers(conn)
-		} else if strings.ToLower(message) == "/stats" {
-			fmt.Fprintf(conn, "You have sent %v messages so far in this room\n", client.NumOfMessages)
+		} else if strings.HasPrefix(message, "/") {
+			cmd := handleCommand(client, strings.ToLower(message[1:]))
+			if cmd == "quit" {
+				return
+			}
 		} else {
-			msg := fmt.Sprintf("%s: %s", client.Username, message)
-			client.NumOfMessages++
-			broadcast(msg, conn)
+			msg := fmt.Sprintf("%s: %s", client.username, message)
+			msgChan <- Message{sender: client, content: msg, broadcastType: ToAllButSender}
+			client.numOfMessages++
 		}
+	}
+}
+
+func registerUser(client *Client, reader *bufio.Reader) error {
+	fmt.Fprintln(client.conn, "Enter username: ")
+	foundUsername := false
+	for !foundUsername {
+		fmt.Fprint(client.conn, "> ")
+		username, err := receiveMessage(reader)
+		if err != nil {
+			return err
+		}
+		username = strings.ToUpper(username)
+		if username == "" {
+			fmt.Fprintln(client.conn, "Username cannot be empty! Enter a different username: ")
+			continue
+		}
+		reply := make(chan bool)
+		registerChan <- RegisterRequest{client: client, username: username, reply: reply}
+		success := <-reply
+		if !success {
+			fmt.Fprintln(client.conn, "Username already in use! Enter a different username: ")
+		} else {
+			foundUsername = true
+		}
+	}
+	return nil
+}
+
+func handleCommand(client *Client, command string) string {
+	switch command {
+	case "quit":
+		msg := fmt.Sprintf("%s has left the chat.", client.username)
+		msgChan <- Message{sender: client, content: msg, broadcastType: ToAllButSender}
+		return "quit"
+	case "users":
+		printConnectedUsers(client)
+		return "users"
+	case "stats":
+		fmt.Fprintf(client.conn, "You have sent %v messages so far in this room\n", client.numOfMessages)
+		return "stats"
+	case "help":
+		fmt.Fprintln(client.conn, "Available commands: \n- /quit \n- /users \n- /stats")
+		return "help"
+	default:
+		fmt.Fprintln(client.conn, "Command not found")
+		return ""
 	}
 }
 
