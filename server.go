@@ -10,7 +10,7 @@ import (
 
 type BroadcastType int
 
-const port = ":9000"
+const port = "9000"
 
 const (
 	ToAll BroadcastType = iota
@@ -20,10 +20,10 @@ const (
 )
 
 type Client struct {
-	conn          net.Conn
-	username      string
-	numOfMessages int
-	writeChan     chan string
+	conn         net.Conn
+	username     string
+	messageCount int
+	writeChan    chan string
 }
 
 type Message struct {
@@ -49,18 +49,22 @@ type RegisterRequest struct {
 
 func NewClient(conn net.Conn) *Client {
 	c := &Client{
-		conn:          conn,
-		numOfMessages: 0,
-		writeChan:     make(chan string, 10),
+		conn:         conn,
+		messageCount: 0,
+		writeChan:    make(chan string, 10),
 	}
 	go c.writeLoop()
 	return c
 }
 
 func (client *Client) writeLoop() {
+	defer client.conn.Close()
 	for msg := range client.writeChan {
-		fmt.Fprintln(client.conn, msg)
-		fmt.Fprint(client.conn, "> ")
+		_, err := fmt.Fprintln(client.conn, msg)
+		if err != nil {
+			return
+		}
+		//fmt.Fprint(client.conn, "> ")
 	}
 }
 
@@ -71,8 +75,8 @@ var userListChan = make(chan UserListRequest)
 var registerChan = make(chan RegisterRequest)
 
 func main() {
-
-	listener, err := net.Listen("tcp", port)
+	portStr := fmt.Sprintf(":%s", port)
+	listener, err := net.Listen("tcp", portStr)
 	if err != nil {
 		log.Fatal("Error listening:", err)
 	}
@@ -101,6 +105,7 @@ func hub() {
 			broadcast(msg)
 		case event := <-leaveChan:
 			delete(clients, event.client.conn)
+			close(event.client.writeChan)
 		case req := <-userListChan:
 			userList := getConnectedUsers()
 			req.reply <- userList
@@ -148,16 +153,18 @@ func getConnectedUsers() []string {
 	return usernames
 }
 
-func printConnectedUsers(client *Client) {
+func formatConnectedUsers() string {
+	var b strings.Builder
+
 	reply := make(chan []string)
 	userListChan <- UserListRequest{reply: reply}
 	users := <-reply
-	msg := fmt.Sprintf("There are currently %v connected users\n", len(users))
-	fmt.Fprint(client.conn, msg)
+
+	fmt.Fprintf(&b, "There are currently %d connected users\n", len(users))
 	for _, username := range users {
-		msg := fmt.Sprintf("- %s\n", username)
-		fmt.Fprint(client.conn, msg)
+		fmt.Fprintf(&b, "- %s\n", username)
 	}
+	return strings.TrimSpace(b.String())
 }
 
 func usernameExists(username string) bool {
@@ -174,8 +181,10 @@ func handleConnection(conn net.Conn) {
 
 	client := NewClient(conn)
 
-	fmt.Fprintln(conn, "Welcome to the chatroom.")
-	printConnectedUsers(client)
+	msg := "Welcome to the chatroom."
+	sendToClient(client, msg)
+
+	sendToClient(client, formatConnectedUsers())
 
 	err := registerUser(client, reader)
 	if err != nil {
@@ -184,20 +193,20 @@ func handleConnection(conn net.Conn) {
 
 	defer func() {
 		leaveChan <- LeaveEvent{client: client}
-		conn.Close()
 	}()
 
-	fmt.Fprintf(conn, "You have joined the chatroom as %s.\n", client.username)
+	msg = fmt.Sprintf("You have joined the chatroom as %s.", client.username)
+	sendToClient(client, msg)
 
-	msg := fmt.Sprintf("%s has joined the chat.", client.username)
-	msgChan <- Message{sender: client, content: msg, broadcastType: ToAllButSender}
+	msg = fmt.Sprintf("%s has joined the chat.", client.username)
+	broadcastFrom(client, msg)
 
 	for {
-		fmt.Fprint(conn, "> ")
+		//fmt.Fprint(conn, "> ")
 		message, err := receiveMessage(reader)
 		if err != nil {
 			msg := fmt.Sprintf("%s has left the chat.", client.username)
-			msgChan <- Message{sender: client, content: msg, broadcastType: ToAllButSender}
+			sendToClient(client, msg)
 			return
 		} else if message == "" {
 			continue
@@ -208,23 +217,25 @@ func handleConnection(conn net.Conn) {
 			}
 		} else {
 			msg := fmt.Sprintf("%s: %s", client.username, message)
-			msgChan <- Message{sender: client, content: msg, broadcastType: ToAllButSender}
-			client.numOfMessages++
+			broadcastFrom(client, msg)
+			client.messageCount++
 		}
 	}
 }
 
 func registerUser(client *Client, reader *bufio.Reader) error {
-	fmt.Fprintln(client.conn, "Enter username: ")
+	msg := "Enter username: "
+	sendToClient(client, msg)
 	for {
-		fmt.Fprint(client.conn, "> ")
+		//fmt.Fprint(client.conn, "> ")
 		username, err := receiveMessage(reader)
 		if err != nil {
 			return err
 		}
 		username = strings.ToUpper(username)
 		if username == "" {
-			fmt.Fprintln(client.conn, "Username cannot be empty! Enter a different username: ")
+			msg := "Username cannot be empty! Enter a different username: "
+			sendToClient(client, msg)
 			continue
 		}
 		reply := make(chan bool)
@@ -232,7 +243,8 @@ func registerUser(client *Client, reader *bufio.Reader) error {
 		if <-reply {
 			return nil
 		}
-		fmt.Fprintln(client.conn, "Username already in use! Enter a different username: ")
+		msg := "Username already in use! Enter a different username: "
+		sendToClient(client, msg)
 	}
 }
 
@@ -240,19 +252,22 @@ func handleCommand(client *Client, command string) string {
 	switch command {
 	case "quit":
 		msg := fmt.Sprintf("%s has left the chat.", client.username)
-		msgChan <- Message{sender: client, content: msg, broadcastType: ToAllButSender}
+		broadcastFrom(client, msg)
 		return "quit"
 	case "users":
-		printConnectedUsers(client)
+		sendToClient(client, formatConnectedUsers())
 		return "users"
 	case "stats":
-		fmt.Fprintf(client.conn, "You have sent %v messages so far in this room\n", client.numOfMessages)
+		msg := fmt.Sprintf("You have sent %v messages so far in this room", client.messageCount)
+		sendToClient(client, msg)
 		return "stats"
 	case "help":
-		fmt.Fprintln(client.conn, "Available commands: \n- /quit \n- /users \n- /stats")
+		msg := "Available commands: \n- /quit \n- /users \n- /stats"
+		sendToClient(client, msg)
 		return "help"
 	default:
-		fmt.Fprintln(client.conn, "Command not found")
+		msg := "Command not found"
+		sendToClient(client, msg)
 		return ""
 	}
 }
@@ -265,4 +280,36 @@ func receiveMessage(reader *bufio.Reader) (string, error) {
 	}
 
 	return strings.TrimSpace(message), err
+}
+
+func sendToClient(client *Client, content string) {
+	msgChan <- Message{
+		sender:        client,
+		content:       content,
+		broadcastType: ToSender,
+	}
+}
+
+func broadcastFrom(client *Client, content string) {
+	msgChan <- Message{
+		sender:        client,
+		content:       content,
+		broadcastType: ToAllButSender,
+	}
+}
+
+func broadcastAll(content string) {
+	msgChan <- Message{
+		content:       content,
+		broadcastType: ToAll,
+	}
+}
+
+func sendToUser(sender, recipient *Client, content string) {
+	msgChan <- Message{
+		sender:        sender,
+		recipient:     recipient,
+		content:       content,
+		broadcastType: ToUser,
+	}
 }
