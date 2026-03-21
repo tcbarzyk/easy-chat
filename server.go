@@ -10,6 +10,8 @@ import (
 
 type BroadcastType int
 
+const port = ":9000"
+
 const (
 	ToAll BroadcastType = iota
 	ToSender
@@ -21,6 +23,7 @@ type Client struct {
 	conn          net.Conn
 	username      string
 	numOfMessages int
+	writeChan     chan string
 }
 
 type Message struct {
@@ -45,9 +48,19 @@ type RegisterRequest struct {
 }
 
 func NewClient(conn net.Conn) *Client {
-	return &Client{
+	c := &Client{
 		conn:          conn,
 		numOfMessages: 0,
+		writeChan:     make(chan string, 10),
+	}
+	go c.writeLoop()
+	return c
+}
+
+func (client *Client) writeLoop() {
+	for msg := range client.writeChan {
+		fmt.Fprintln(client.conn, msg)
+		fmt.Fprint(client.conn, "> ")
 	}
 }
 
@@ -59,14 +72,14 @@ var registerChan = make(chan RegisterRequest)
 
 func main() {
 
-	listener, err := net.Listen("tcp", ":9000")
+	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		log.Fatal("Error listening:", err)
 	}
 
 	defer listener.Close()
 
-	log.Println("Server listening...")
+	log.Printf("Server listening on port %s...\n", port)
 	go hub()
 
 	for {
@@ -107,24 +120,20 @@ func hub() {
 func broadcast(msg Message) {
 	switch msg.broadcastType {
 	case ToAll:
-		for conn := range clients {
-			fmt.Fprintln(conn, msg.content)
-			fmt.Fprint(conn, "> ")
+		for _, client := range clients {
+			client.writeChan <- msg.content
 		}
 	case ToSender:
-		fmt.Fprintln(msg.sender.conn, msg.content)
-		fmt.Fprint(msg.sender.conn, "> ")
+		msg.sender.writeChan <- msg.content
 	case ToAllButSender:
-		for conn := range clients {
-			if conn != msg.sender.conn {
-				fmt.Fprintln(conn, msg.content)
-				fmt.Fprint(conn, "> ")
+		for _, client := range clients {
+			if client.conn != msg.sender.conn {
+				client.writeChan <- msg.content
 			}
 		}
 	case ToUser:
 		if msg.recipient != nil {
-			fmt.Fprintln(msg.recipient.conn, msg.content)
-			fmt.Fprint(msg.recipient.conn, "> ")
+			msg.recipient.writeChan <- msg.content
 		}
 	}
 }
@@ -207,8 +216,7 @@ func handleConnection(conn net.Conn) {
 
 func registerUser(client *Client, reader *bufio.Reader) error {
 	fmt.Fprintln(client.conn, "Enter username: ")
-	foundUsername := false
-	for !foundUsername {
+	for {
 		fmt.Fprint(client.conn, "> ")
 		username, err := receiveMessage(reader)
 		if err != nil {
@@ -221,14 +229,11 @@ func registerUser(client *Client, reader *bufio.Reader) error {
 		}
 		reply := make(chan bool)
 		registerChan <- RegisterRequest{client: client, username: username, reply: reply}
-		success := <-reply
-		if !success {
-			fmt.Fprintln(client.conn, "Username already in use! Enter a different username: ")
-		} else {
-			foundUsername = true
+		if <-reply {
+			return nil
 		}
+		fmt.Fprintln(client.conn, "Username already in use! Enter a different username: ")
 	}
-	return nil
 }
 
 func handleCommand(client *Client, command string) string {
