@@ -178,8 +178,17 @@ func usernameExists(username string) bool {
 
 func handleConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
-
 	client := NewClient(conn)
+
+	registered := false
+
+	defer func() {
+		if registered {
+			leaveChan <- LeaveEvent{client: client}
+		} else {
+			close(client.writeChan)
+		}
+	}()
 
 	msg := "Welcome to the chatroom."
 	sendToClient(client, msg)
@@ -191,22 +200,17 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	defer func() {
-		leaveChan <- LeaveEvent{client: client}
-	}()
+	registered = true
 
-	msg = fmt.Sprintf("You have joined the chatroom as %s.", client.username)
-	sendToClient(client, msg)
+	sendToClient(client, fmt.Sprintf("You have joined the chatroom as %s.", client.username))
 
-	msg = fmt.Sprintf("%s has joined the chat.", client.username)
-	broadcastFrom(client, msg)
+	broadcastFrom(client, fmt.Sprintf("%s has joined the chat.", client.username))
 
 	for {
 		//fmt.Fprint(conn, "> ")
 		message, err := receiveMessage(reader)
 		if err != nil {
-			msg := fmt.Sprintf("%s has left the chat.", client.username)
-			sendToClient(client, msg)
+			broadcastFrom(client, fmt.Sprintf("%s has left the chat.", client.username))
 			return
 		} else if message == "" {
 			continue
@@ -216,26 +220,22 @@ func handleConnection(conn net.Conn) {
 				return
 			}
 		} else {
-			msg := fmt.Sprintf("%s: %s", client.username, message)
-			broadcastFrom(client, msg)
+			broadcastFrom(client, fmt.Sprintf("%s: %s", client.username, message))
 			client.messageCount++
 		}
 	}
 }
 
 func registerUser(client *Client, reader *bufio.Reader) error {
-	msg := "Enter username: "
-	sendToClient(client, msg)
+	sendToClient(client, "Enter username: ")
 	for {
-		//fmt.Fprint(client.conn, "> ")
 		username, err := receiveMessage(reader)
 		if err != nil {
 			return err
 		}
 		username = strings.ToUpper(username)
 		if username == "" {
-			msg := "Username cannot be empty! Enter a different username: "
-			sendToClient(client, msg)
+			sendToClient(client, "Username cannot be empty! Enter a different username: ")
 			continue
 		}
 		reply := make(chan bool)
@@ -243,31 +243,26 @@ func registerUser(client *Client, reader *bufio.Reader) error {
 		if <-reply {
 			return nil
 		}
-		msg := "Username already in use! Enter a different username: "
-		sendToClient(client, msg)
+		sendToClient(client, "Username already in use! Enter a different username: ")
 	}
 }
 
 func handleCommand(client *Client, command string) string {
 	switch command {
 	case "quit":
-		msg := fmt.Sprintf("%s has left the chat.", client.username)
-		broadcastFrom(client, msg)
+		broadcastFrom(client, fmt.Sprintf("%s has left the chat.", client.username))
 		return "quit"
 	case "users":
 		sendToClient(client, formatConnectedUsers())
 		return "users"
 	case "stats":
-		msg := fmt.Sprintf("You have sent %v messages so far in this room", client.messageCount)
-		sendToClient(client, msg)
+		sendToClient(client, fmt.Sprintf("You have sent %v messages so far in this room", client.messageCount))
 		return "stats"
 	case "help":
-		msg := "Available commands: \n- /quit \n- /users \n- /stats"
-		sendToClient(client, msg)
+		sendToClient(client, "Available commands: \n- /quit \n- /users \n- /stats")
 		return "help"
 	default:
-		msg := "Command not found"
-		sendToClient(client, msg)
+		sendToClient(client, "Command not found")
 		return ""
 	}
 }
