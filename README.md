@@ -22,6 +22,7 @@ nc localhost 9000
 | `/stats` | Show your message count |
 | `/help` | Show available commands |
 | `/quit` | Leave the chatroom |
+| `/msg <user> <body>` | Send a direct message to another user |
 
 ## Design decisions
 
@@ -35,7 +36,6 @@ nc localhost 9000
 
 ## Planned features
 
-- **Direct messages** — `/dm <user> <message>` using the existing `ToUser` broadcast path, which is already wired but not exposed as a command
 - **Message history** — replay the last N messages to clients on join, stored as a ring buffer in the hub
 - **Chat rooms** — `/join <room>` and `/leave`, with broadcasts scoped to room membership
 - **Ping / keepalive** — periodic writes to detect and evict stale connections

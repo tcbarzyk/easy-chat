@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -27,10 +28,10 @@ type Client struct {
 }
 
 type Message struct {
-	sender        *Client
-	recipient     *Client
-	content       string
-	broadcastType BroadcastType
+	sender            *Client
+	recipientUsername string
+	content           string
+	broadcastType     BroadcastType
 }
 
 type LeaveEvent struct {
@@ -137,10 +138,22 @@ func broadcast(msg Message) {
 			}
 		}
 	case ToUser:
-		if msg.recipient != nil {
-			msg.recipient.writeChan <- msg.content
+		recipient := findClientByUsername(msg.recipientUsername)
+		if recipient == nil {
+			msg.sender.writeChan <- "Error: recipient not found"
+			return
+		}
+		recipient.writeChan <- msg.content
+	}
+}
+
+func findClientByUsername(username string) *Client {
+	for _, c := range clients {
+		if c.username == username {
+			return c
 		}
 	}
+	return nil
 }
 
 func getConnectedUsers() []string {
@@ -184,6 +197,7 @@ func handleConnection(conn net.Conn) {
 
 	defer func() {
 		if registered {
+			broadcastFrom(client, fmt.Sprintf("%s has left the chat.", client.username))
 			leaveChan <- LeaveEvent{client: client}
 		} else {
 			close(client.writeChan)
@@ -210,13 +224,16 @@ func handleConnection(conn net.Conn) {
 		//fmt.Fprint(conn, "> ")
 		message, err := receiveMessage(reader)
 		if err != nil {
-			broadcastFrom(client, fmt.Sprintf("%s has left the chat.", client.username))
+			//err is handled by recieveMessage
 			return
 		} else if message == "" {
 			continue
 		} else if strings.HasPrefix(message, "/") {
-			cmd := handleCommand(client, strings.ToLower(message[1:]))
-			if cmd == "quit" {
+			shouldQuit, err := handleCommand(client, message[1:])
+			if err != nil {
+				sendToClient(client, fmt.Sprintf("Error: %v", err))
+			}
+			if shouldQuit {
 				return
 			}
 		} else {
@@ -247,23 +264,46 @@ func registerUser(client *Client, reader *bufio.Reader) error {
 	}
 }
 
-func handleCommand(client *Client, command string) string {
-	switch command {
+var (
+	ErrEmptyCommand   = errors.New("command cannot be empty")
+	ErrUnknownCommand = errors.New("command not found")
+	ErrInvalidSyntax  = errors.New("invalid syntax")
+	ErrSelfMessage    = errors.New("you cannot send a private message to yourself")
+)
+
+func handleCommand(client *Client, command string) (bool, error) {
+	command = strings.TrimSpace(command)
+	if len(command) == 0 {
+		return false, ErrEmptyCommand
+	}
+	args := strings.Fields(command)
+	cmd := strings.ToLower(args[0])
+	switch cmd {
 	case "quit":
 		broadcastFrom(client, fmt.Sprintf("%s has left the chat.", client.username))
-		return "quit"
+		return true, nil
 	case "users":
 		sendToClient(client, formatConnectedUsers())
-		return "users"
+		return false, nil
 	case "stats":
 		sendToClient(client, fmt.Sprintf("You have sent %v messages so far in this room", client.messageCount))
-		return "stats"
+		return false, nil
 	case "help":
-		sendToClient(client, "Available commands: \n- /quit \n- /users \n- /stats")
-		return "help"
+		sendToClient(client, "Available commands: \n- /quit \n- /users \n- /stats\n- /msg <user> <body>")
+		return false, nil
+	case "msg":
+		if len(args) < 3 {
+			return false, fmt.Errorf("%w: usage is /msg <user> <body>", ErrInvalidSyntax)
+		}
+		recipientUsername := strings.ToUpper(args[1])
+		if recipientUsername == client.username {
+			return false, ErrSelfMessage
+		}
+		msg := fmt.Sprintf("Message from %s: %s", client.username, strings.Join(args[2:], " "))
+		sendToUser(client, recipientUsername, msg)
+		return false, nil
 	default:
-		sendToClient(client, "Command not found")
-		return ""
+		return false, ErrUnknownCommand
 	}
 }
 
@@ -300,11 +340,11 @@ func broadcastAll(content string) {
 	}
 }
 
-func sendToUser(sender, recipient *Client, content string) {
+func sendToUser(sender *Client, recipientUsername string, content string) {
 	msgChan <- Message{
-		sender:        sender,
-		recipient:     recipient,
-		content:       content,
-		broadcastType: ToUser,
+		sender:            sender,
+		recipientUsername: recipientUsername,
+		content:           content,
+		broadcastType:     ToUser,
 	}
 }
