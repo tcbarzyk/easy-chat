@@ -3,19 +3,17 @@ package main
 import (
 	"bufio"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"strings"
 	"tcbarzyk.dev/chat-server/pkg/buffer"
 )
 
-import _ "net/http/pprof"
-import "net/http"
-
 type BroadcastType int
-
-const port = "9000"
 
 const (
 	ToAll BroadcastType = iota
@@ -82,18 +80,26 @@ var registerChan = make(chan RegisterRequest)
 var history = buffer.NewRingBuffer[*Message](50)
 
 func main() {
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
-	portStr := fmt.Sprintf(":%s", port)
-	listener, err := net.Listen("tcp", portStr)
+	debugMode := flag.Bool("debug", false, "enable pprof server on localhost:6060")
+	port := flag.Int("port", 9000, "The port for the chat server to listen on")
+	flag.Parse()
+	if *debugMode {
+		go func() {
+			log.Println("Debug mode enabled. pprof listening on localhost:6060")
+			if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+				log.Printf("Debug server error: %v", err)
+			}
+		}()
+	}
+	address := fmt.Sprintf(":%d", *port)
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		log.Fatal("Error listening:", err)
 	}
 
 	defer listener.Close()
 
-	log.Printf("Server listening on port %s...\n", port)
+	log.Printf("Server listening on %s...\n", address)
 	go hub()
 
 	for {
