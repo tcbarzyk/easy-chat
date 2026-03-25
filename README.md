@@ -24,6 +24,14 @@ nc localhost 9000
 | `/quit` | Leave the chatroom |
 | `/msg <user> <body>` | Send a direct message to another user |
 
+## Features
+
+### Message history
+
+The server keeps the most recent `50` broadcast messages in an in-memory ring buffer. After a user connects, picks a username, and enters the chat, those buffered messages are replayed to that client before the server announces their join to everyone else.
+
+This history currently includes public chat traffic and join/leave broadcasts. It does not include private messages or sender-only command responses like `/users`, `/stats`, or `/help`.
+
 ## Design decisions
 
 **Single hub goroutine for shared state.** All mutations to the `clients` map — registration, lookup, deletion — go through a single `hub()` goroutine via channels (`msgChan`, `registerChan`, `leaveChan`, `userListChan`). This avoids mutexes entirely and makes the concurrency model easy to reason about: only one goroutine ever touches shared state.
@@ -36,7 +44,6 @@ nc localhost 9000
 
 ## Planned features
 
-- **Message history** — replay the last N messages to clients on join, stored as a ring buffer in the hub
 - **Chat rooms** — `/join <room>` and `/leave`, with broadcasts scoped to room membership
 - **Ping / keepalive** — periodic writes to detect and evict stale connections
 - **Rate limiting** — per-client token bucket to prevent message spam

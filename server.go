@@ -7,7 +7,11 @@ import (
 	"log"
 	"net"
 	"strings"
+	"tcbarzyk.dev/chat-server/pkg/buffer"
 )
+
+import _ "net/http/pprof"
+import "net/http"
 
 type BroadcastType int
 
@@ -52,7 +56,7 @@ func NewClient(conn net.Conn) *Client {
 	c := &Client{
 		conn:         conn,
 		messageCount: 0,
-		writeChan:    make(chan string, 10),
+		writeChan:    make(chan string, 100),
 	}
 	go c.writeLoop()
 	return c
@@ -70,12 +74,17 @@ func (client *Client) writeLoop() {
 }
 
 var clients = make(map[net.Conn]*Client)
-var msgChan = make(chan Message)
+var msgChan = make(chan Message, 100)
 var leaveChan = make(chan LeaveEvent)
 var userListChan = make(chan UserListRequest)
 var registerChan = make(chan RegisterRequest)
 
+var history = buffer.NewRingBuffer[*Message](50)
+
 func main() {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 	portStr := fmt.Sprintf(":%s", port)
 	listener, err := net.Listen("tcp", portStr)
 	if err != nil {
@@ -126,12 +135,16 @@ func hub() {
 func broadcast(msg Message) {
 	switch msg.broadcastType {
 	case ToAll:
+		msgCopy := msg
+		history.Write(&msgCopy)
 		for _, client := range clients {
 			client.writeChan <- msg.content
 		}
 	case ToSender:
 		msg.sender.writeChan <- msg.content
 	case ToAllButSender:
+		msgCopy := msg
+		history.Write(&msgCopy)
 		for _, client := range clients {
 			if client.conn != msg.sender.conn {
 				client.writeChan <- msg.content
@@ -189,6 +202,12 @@ func usernameExists(username string) bool {
 	return false
 }
 
+func displayMessageHistory(c *Client) {
+	for _, msg := range history.GetAll() {
+		c.Send(msg.content)
+	}
+}
+
 func handleConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	client := NewClient(conn)
@@ -204,10 +223,9 @@ func handleConnection(conn net.Conn) {
 		}
 	}()
 
-	msg := "Welcome to the chatroom."
-	sendToClient(client, msg)
+	client.Send("Welcome to the chatroom.")
 
-	sendToClient(client, formatConnectedUsers())
+	client.Send(formatConnectedUsers())
 
 	err := registerUser(client, reader)
 	if err != nil {
@@ -216,7 +234,11 @@ func handleConnection(conn net.Conn) {
 
 	registered = true
 
-	sendToClient(client, fmt.Sprintf("You have joined the chatroom as %s.", client.username))
+	client.Send(fmt.Sprintf("You have joined the chatroom as %s.", client.username))
+
+	client.Send("--------BEGIN CHAT--------")
+
+	displayMessageHistory(client)
 
 	broadcastFrom(client, fmt.Sprintf("%s has joined the chat.", client.username))
 
@@ -231,7 +253,7 @@ func handleConnection(conn net.Conn) {
 		} else if strings.HasPrefix(message, "/") {
 			shouldQuit, err := handleCommand(client, message[1:])
 			if err != nil {
-				sendToClient(client, fmt.Sprintf("Error: %v", err))
+				broadcastToSender(client, fmt.Sprintf("Error: %v", err))
 			}
 			if shouldQuit {
 				return
@@ -244,7 +266,7 @@ func handleConnection(conn net.Conn) {
 }
 
 func registerUser(client *Client, reader *bufio.Reader) error {
-	sendToClient(client, "Enter username: ")
+	client.Send("Enter username: ")
 	for {
 		username, err := receiveMessage(reader)
 		if err != nil {
@@ -252,7 +274,7 @@ func registerUser(client *Client, reader *bufio.Reader) error {
 		}
 		username = strings.ToUpper(username)
 		if username == "" {
-			sendToClient(client, "Username cannot be empty! Enter a different username: ")
+			client.Send("Username cannot be empty! Enter a different username: ")
 			continue
 		}
 		reply := make(chan bool)
@@ -260,7 +282,7 @@ func registerUser(client *Client, reader *bufio.Reader) error {
 		if <-reply {
 			return nil
 		}
-		sendToClient(client, "Username already in use! Enter a different username: ")
+		client.Send("Username already in use! Enter a different username: ")
 	}
 }
 
@@ -280,16 +302,15 @@ func handleCommand(client *Client, command string) (bool, error) {
 	cmd := strings.ToLower(args[0])
 	switch cmd {
 	case "quit":
-		broadcastFrom(client, fmt.Sprintf("%s has left the chat.", client.username))
 		return true, nil
 	case "users":
-		sendToClient(client, formatConnectedUsers())
+		broadcastToSender(client, formatConnectedUsers())
 		return false, nil
 	case "stats":
-		sendToClient(client, fmt.Sprintf("You have sent %v messages so far in this room", client.messageCount))
+		broadcastToSender(client, fmt.Sprintf("You have sent %v messages so far in this room", client.messageCount))
 		return false, nil
 	case "help":
-		sendToClient(client, "Available commands: \n- /quit \n- /users \n- /stats\n- /msg <user> <body>")
+		broadcastToSender(client, "Available commands: \n- /quit \n- /users \n- /stats\n- /msg <user> <body>")
 		return false, nil
 	case "msg":
 		if len(args) < 3 {
@@ -317,7 +338,7 @@ func receiveMessage(reader *bufio.Reader) (string, error) {
 	return strings.TrimSpace(message), err
 }
 
-func sendToClient(client *Client, content string) {
+func broadcastToSender(client *Client, content string) {
 	msgChan <- Message{
 		sender:        client,
 		content:       content,
@@ -346,5 +367,15 @@ func sendToUser(sender *Client, recipientUsername string, content string) {
 		recipientUsername: recipientUsername,
 		content:           content,
 		broadcastType:     ToUser,
+	}
+}
+
+func (c *Client) Send(content string) bool {
+	select {
+	case c.writeChan <- content:
+		return true
+	default:
+		log.Printf("Dropped message for %s (buffer full)", c.username)
+		return false
 	}
 }
